@@ -32,9 +32,10 @@ from .vertex_accumulator import (
 )
 from .vertex_estimate import (
     NoEstimateCounts,
-    weighted_mean_or_nan,
+    attributed_mean_or_nan,
     has_estimate,
     count_no_estimate,
+    count_zero_credit,
 )
 from .vertex_weights import vertex_weights
 from .touch_frame_weights import touch_frame_weights, touch_label
@@ -133,9 +134,10 @@ __all__ = [
     "accumulate_vertex_values_into",
     # vertex_estimate
     "NoEstimateCounts",
-    "weighted_mean_or_nan",
+    "attributed_mean_or_nan",
     "has_estimate",
     "count_no_estimate",
+    "count_zero_credit",
     # vertex_weights
     "vertex_weights",
     # touch_frame_weights

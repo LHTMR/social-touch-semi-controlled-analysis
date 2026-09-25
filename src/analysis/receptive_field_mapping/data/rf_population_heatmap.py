@@ -33,7 +33,7 @@ def compute_rf_heatmap(
             accum, verts, vals, np.ones(len(verts), dtype=np.float64)
         )
     result = accum.value_sum
-    count = accum.weight_sum
+    count = accum.count.astype(np.float64)
     nonzero = count > 0
     result[nonzero] /= count[nonzero]
     result[~nonzero] = np.nan

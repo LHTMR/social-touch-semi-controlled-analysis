@@ -49,7 +49,7 @@ tasks:
   # Output: 4_analysed/single_touch_rf_maps/<session_id>/single_touch_rf_maps.npz
   spatial_map_single_touch:
     category: spatial_sensitivity
-    enabled: true
+    enabled: false
     bypass: false
     options:
       force_processing: false
@@ -121,7 +121,7 @@ tasks:
   # Output: interactive GUI + rf_camera_settings.json
   spatial_set_camera:
     category: viewer_required
-    enabled: true
+    enabled: false
     bypass: false
     options:
       force_processing: false
@@ -456,7 +456,7 @@ tasks:
   # Output: 4_analysed/touch_features/<feature>/<session>_touch_summary.csv
   stimulus_extract_features:
     category: stimulus_sensitivity
-    enabled: true
+    enabled: false
     bypass: false
     options:
       force_processing: false

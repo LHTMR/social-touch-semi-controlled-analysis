@@ -9,19 +9,28 @@ accumulators run in a single pass for efficiency.
 
 The **mean is depth-weighted**: each contact point is credited in proportion to
 how fully it was pressed relative to the deepest point of its own frame, raised
-to ``depth_weight_alpha``. The **max is not weighted**, because a weighted
-maximum has no meaning. ``depth_weight_alpha = 0`` reproduces the unweighted
-maps exactly, through the same code path with every weight equal to ``1.0``.
-Both ``.npz`` files also carry the confidence channel — per-vertex ``weight_sum``
-and Kish ``n_eff`` — which display code consumes and which never alters the
-estimate.
+to ``depth_weight_alpha``, and the per-vertex total is divided by the **number of
+contact points**, not by the sum of their weights. Dividing by the weight sum
+would cancel the weighting back out and leave a barely-grazed vertex reporting a
+full-size firing rate; dividing by the count lets the weighting reach the answer,
+so the map shows how much firing each vertex is *credited* with. See
+``data.vertex_estimate`` for the worked example. The **max is not weighted**,
+because a weighted maximum has no meaning. ``depth_weight_alpha = 0`` reproduces
+the unweighted maps exactly, through the same code path with every weight equal
+to ``1.0`` — at which point the weight sum and the contact count are the same
+number, so the divisor choice cannot move that baseline. Both ``.npz`` files also
+carry the confidence channel — per-vertex ``weight_sum`` and Kish ``n_eff`` —
+which display code consumes and which never alters the estimate.
 
-A contacted vertex with **no estimate** — every frame grazing, so ``sum(w) == 0``
-at ``depth_weight_alpha > 0``, or every contributing frame's neuron value NaN — is
-excluded from the maps and **counted**. The per-session totals are written into
+A contacted vertex with **no estimate** — every contributing frame's neuron value
+NaN — is excluded from the maps and **counted**, because an excluded vertex is
+otherwise indistinguishable from one that was never touched. A vertex that was
+contacted but only ever *grazed* is **not** excluded: its total weight is 0, its
+contact count is not, so its attributed rate is a genuine ``0.0`` and it goes on
+the map. Those are counted separately, as a diagnostic about vertices that are on
+the map rather than an exclusion tally. Both totals are written into
 ``single_touch_rf_summary.json`` next to ``depth_weight_alpha`` and printed at the
-end of the session, because an excluded vertex is otherwise indistinguishable from
-one that was never touched.
+end of the session.
 
 Depends on: ``touch_prepare_sessions`` (reads ``<session>_prepared.csv``).
 """
@@ -39,8 +48,9 @@ from analysis.receptive_field_mapping.data.vertex_accumulator import (
     empty_accumulator,
 )
 from analysis.receptive_field_mapping.data.vertex_estimate import (
+    attributed_mean_or_nan,
     count_no_estimate,
-    weighted_mean_or_nan,
+    count_zero_credit,
 )
 from analysis.receptive_field_mapping.data.touch_frame_weights import (
     touch_frame_weights,
@@ -83,12 +93,14 @@ class TouchRFMaps(NamedTuple):
     max_pairs: List[Tuple[int, float]]
     weight_sum_pairs: List[Tuple[int, float]]
     n_eff_pairs: List[Tuple[int, float]]
-    #: Contacted vertices dropped because every frame that touched them was
-    #: grazing, so their total weight is 0 and the weighted mean is 0/0.
-    n_no_estimate_zero_weight: int
     #: Contacted vertices dropped because every contributing frame's neuron
     #: value was NaN (e.g. the unit was not held during the touch window).
     n_no_estimate_nan_value: int
+    #: Contacted vertices **kept**, at exactly ``0.0``, because every frame that
+    #: touched them was grazing: they carry zero depth credit, which is a
+    #: measurement and not a gap. Counted because that ``0.0`` is otherwise
+    #: indistinguishable from a deeply-pressed vertex whose neuron stayed silent.
+    n_zero_credit: int
 
 
 def _compute_touch_rf(
@@ -146,24 +158,31 @@ def _compute_touch_rf(
     -------
     ``TouchRFMaps`` — mean, max, ``weight_sum`` and Kish ``n_eff`` as
     ``(vertex_idx, value)`` pairs over the same vertices in the same order, plus
-    a count of the contacted vertices that were **excluded** and why.
+    a count of the contacted vertices that were **excluded**, and a count of the
+    contacted vertices that were **kept at zero credit**.
+
+    The mean is ``sum(w_i * x_i) / N``, where ``N`` is the vertex's contact-point
+    count — not ``sum(w_i)``. The weighting therefore survives into the value:
+    a vertex pressed only shallowly reports a small number rather than a
+    full-size rate divided by a small denominator. At ``depth_weight_alpha = 0``
+    every weight is ``1.0`` and ``sum(w) == N``, so the unweighted baseline comes
+    out of the same arithmetic unchanged.
 
     Vertices with **no estimate** are excluded from all four lists. "No
-    estimate" is not "zero response" — nothing was measured to be zero, the
-    estimator is simply undefined there — and both causes are counted so the
-    exclusion is visible rather than silent:
+    estimate" is not "zero response" — nothing was measured at all — and the
+    cause is counted so the exclusion is visible rather than silent:
 
-    * ``sum(w) == 0``: the vertex was contacted, but every frame that touched it
-      was grazing, so it carries **no penetration evidence** at this alpha and
-      the weighted mean is ``0/0``. It is *not* backfilled from the unweighted
-      mean: that would mix two different estimators inside one map. Unreachable
-      at ``depth_weight_alpha = 0``, where every weight is exactly ``1.0``.
     * mean is NaN: every contributing frame's neuron value was NaN (e.g. the
       unit was not held during the touch window — see ST13-03 blocks 5–8), so
       there is a press but no neural measurement.
 
-    Both are the same statement — "this vertex has no number" — and both take
-    the same exit: absent from the map, present in the count.
+    A contacted but **entirely grazing** vertex is deliberately *not* in that
+    list. Its total weight is 0, but its contact count is not, so the estimator
+    returns ``0.0`` rather than ``0/0``: the vertex was pressed, it earned zero
+    depth credit, and zero firing is attributed to it. That is a measurement, so
+    it goes on the map. It is counted in ``n_zero_credit`` because the resulting
+    ``0.0`` is indistinguishable, once on disk, from a deeply-pressed vertex
+    whose neuron was silent — the count is what keeps those two readable apart.
 
     Raises
     ------
@@ -208,55 +227,69 @@ def _compute_touch_rf(
     val_max = accum.value_max
     weight_sum = accum.weight_sum
     weight_sq_sum = accum.weight_sq_sum
+    contact_count = accum.count
 
     if not touched:
         return TouchRFMaps([], [], [], [], 0, 0)
 
-    # The contacted set comes from the vertex lists, not from ``weight_sum > 0``.
-    # Those two agree at alpha = 0 but part company above it: a vertex that was
-    # genuinely contacted, but only ever grazingly, accumulates zero total weight.
-    # Both "never contacted" and "contacted but weightless" leave
-    # ``weight_sum == 0``, and only the second is something to report — so the
-    # contacted set has to be read off the vertex lists to keep them separable.
+    # The contacted set comes from the vertex lists, not from ``count > 0``. The
+    # two now agree — the accumulator counts exactly the contact points the vertex
+    # lists carry — but reading it off the lists keeps the contacted set defined by
+    # the data rather than by an accumulator field, which is what lets the
+    # zero-credit diagnostic below tell "never contacted" from "contacted but
+    # grazing" when both leave ``weight_sum == 0``.
     contacted_indices = np.unique(np.concatenate(touched))
     contacted_value_sum = val_sum[contacted_indices]
     contacted_weight_sum = weight_sum[contacted_indices]
+    contacted_count = contact_count[contacted_indices]
 
     # One estimator, shared with ``gui.touch_playback_explorer``: the vertices
     # this drops and the vertices the viewer paints grey are the same set by
-    # construction. NaN out of it means *no estimate* — never a measured zero.
-    mean_values = weighted_mean_or_nan(contacted_value_sum, contacted_weight_sum)
-    no_estimate_counts = count_no_estimate(contacted_value_sum, contacted_weight_sum)
+    # construction. The divisor is the contact count, so the depth weighting
+    # reaches the value instead of cancelling out of it. NaN out of it means *no
+    # estimate* — never a measured zero.
+    mean_values = attributed_mean_or_nan(contacted_value_sum, contacted_count)
+    no_estimate_counts = count_no_estimate(contacted_value_sum, contacted_count)
+    n_zero_credit = count_zero_credit(contacted_count, contacted_weight_sum)
 
-    # Two kinds of "no estimate", one exit. A zero-weight vertex has no
-    # penetration evidence at this alpha; a NaN-mean vertex has no neural
-    # measurement. Neither is backfilled — falling back to the unweighted mean
-    # would put two different estimators in one map — and neither reaches the
-    # output as ``0.0`` or ``NaN`` pretending to be a measurement. They are
-    # dropped and counted, and the count travels out in ``TouchRFMaps`` and into
-    # ``single_touch_rf_summary.json``.
+    # One kind of "no estimate", one exit: a NaN-mean vertex has no neural
+    # measurement. It is not backfilled and does not reach the output as ``0.0``
+    # pretending to be a measurement — it is dropped and counted, and the count
+    # travels out in ``TouchRFMaps`` and into ``single_touch_rf_summary.json``.
     #
     # The same mask is applied to max, ``weight_sum`` and ``n_eff``: if the mean
     # does not exist the vertex is not in the map at all, and all four lists stay
-    # vertex-aligned. It also keeps ``n_eff``'s divisor positive — ``weight_sq_sum``
-    # is 0 exactly where ``weight_sum`` is.
+    # vertex-aligned.
     estimated = ~np.isnan(mean_values)
     if not estimated.any():
         return TouchRFMaps(
             [], [], [], [],
-            no_estimate_counts.zero_weight,
             no_estimate_counts.nan_value,
+            n_zero_credit,
         )
     kept_indices = contacted_indices[estimated]
     mean_values = mean_values[estimated]
     max_values = val_max[kept_indices]
     weight_sum_values = weight_sum[kept_indices]
-    # Kish effective sample size. Well defined wherever ``weight_sum > 0``,
-    # because a positive weight has a positive square. Flat weights give
-    # ``n_eff`` equal to the number of contributing frames however small those
-    # weights are — being shallow costs no evidence, only being *inconsistently*
-    # shallow does.
-    n_eff_values = (weight_sum_values * weight_sum_values) / weight_sq_sum[kept_indices]
+    # Kish effective sample size. Flat weights give ``n_eff`` equal to the number
+    # of contributing frames however small those weights are — being shallow costs
+    # no evidence, only being *inconsistently* shallow does.
+    #
+    # ``weight_sq_sum`` is 0 exactly where ``weight_sum`` is, and those vertices
+    # are no longer dropped: a grazing-only vertex now keeps its ``0.0`` estimate,
+    # so ``(sum w)^2 / sum(w^2)`` reaches this line as ``0/0``. That case is
+    # written out as NaN **explicitly** rather than left to IEEE, because NaN here
+    # is a real statement — a vertex with zero total weight has no effective
+    # sample size, however many contact points it collected — and letting NumPy
+    # produce it would also emit an invalid-value warning on a legitimate run.
+    kept_weight_sq_sum = weight_sq_sum[kept_indices]
+    has_weight = kept_weight_sq_sum > 0.0
+    n_eff_values = np.where(
+        has_weight,
+        (weight_sum_values * weight_sum_values)
+        / np.where(has_weight, kept_weight_sq_sum, 1.0),
+        np.nan,
+    )
     return TouchRFMaps(
         mean_pairs=[(int(i), float(v)) for i, v in zip(kept_indices, mean_values)],
         max_pairs=[(int(i), float(v)) for i, v in zip(kept_indices, max_values)],
@@ -264,8 +297,8 @@ def _compute_touch_rf(
             (int(i), float(v)) for i, v in zip(kept_indices, weight_sum_values)
         ],
         n_eff_pairs=[(int(i), float(v)) for i, v in zip(kept_indices, n_eff_values)],
-        n_no_estimate_zero_weight=no_estimate_counts.zero_weight,
         n_no_estimate_nan_value=no_estimate_counts.nan_value,
+        n_zero_credit=n_zero_credit,
     )
 
 
@@ -443,9 +476,13 @@ def run_single_touch_rf_mapping(
         # vertex excluded from one touch's map is invisible in the artifact —
         # absent looks exactly like never-touched — so the exclusion is carried
         # out here and written to the sentinel rather than being dropped.
-        no_estimate_zero_weight = 0
         no_estimate_nan_value = 0
-        touches_with_zero_weight_vertices = 0
+        # Contacted vertices kept on the map at exactly 0.0 because every frame
+        # that touched them was grazing. Not an exclusion — they are in the
+        # maps — but the 0.0 they carry is an attribution result rather than a
+        # silent neuron, and only this count says which.
+        zero_credit_vertices = 0
+        touches_with_zero_credit_vertices = 0
 
         for block_id in playback.block_order_ids:
             for trial_id in playback.trial_ids_by_block[block_id]:
@@ -459,20 +496,22 @@ def run_single_touch_rf_mapping(
                     rf_data_max[incremental_id] = maps.max_pairs
                     rf_weight_sum[incremental_id] = maps.weight_sum_pairs
                     rf_n_eff[incremental_id] = maps.n_eff_pairs
-                    no_estimate_zero_weight += maps.n_no_estimate_zero_weight
                     no_estimate_nan_value += maps.n_no_estimate_nan_value
-                    if maps.n_no_estimate_zero_weight:
-                        touches_with_zero_weight_vertices += 1
+                    zero_credit_vertices += maps.n_zero_credit
+                    if maps.n_zero_credit:
+                        touches_with_zero_credit_vertices += 1
                         logger.warning(
                             "[Single-Touch RF] %s: touch %s — %d contacted "
-                            "vertex/vertices excluded from the mean map: every "
-                            "frame that touched them was grazing, so their total "
-                            "weight is 0 at depth_weight_alpha=%r and the weighted "
-                            "mean is 0/0. They are dropped, not backfilled from "
-                            "the unweighted mean.",
+                            "vertex/vertices carry zero depth credit at "
+                            "depth_weight_alpha=%r: every frame that touched them "
+                            "was grazing, so their total weight is 0 and their "
+                            "attributed rate is exactly 0.0. They are kept in the "
+                            "mean map — 0.0 is what the estimator measures "
+                            "there — but their Kish n_eff is NaN, because zero "
+                            "total weight is no effective sample.",
                             session_id,
                             _touch_label(touch),
-                            maps.n_no_estimate_zero_weight,
+                            maps.n_zero_credit,
                             depth_weight_alpha,
                         )
                     incremental_id += 1
@@ -484,13 +523,15 @@ def run_single_touch_rf_mapping(
         )
         print(
             f"[Single-Touch RF] {session_id}: no estimate at "
-            f"{no_estimate_zero_weight + no_estimate_nan_value} contacted "
-            f"vertex-touches "
-            f"({no_estimate_zero_weight} all-grazing at "
+            f"{no_estimate_nan_value} contacted vertex-touches (no neural "
+            f"value). Excluded from the maps, never backfilled."
+        )
+        print(
+            f"[Single-Touch RF] {session_id}: zero depth credit at "
+            f"{zero_credit_vertices} contacted vertex-touches at "
             f"depth_weight_alpha={depth_weight_alpha!r}, across "
-            f"{touches_with_zero_weight_vertices} touches; "
-            f"{no_estimate_nan_value} with no neural value). Excluded from the "
-            f"maps, never backfilled."
+            f"{touches_with_zero_credit_vertices} touches. Kept in the maps at "
+            f"exactly 0.0 — a measurement, not a gap."
         )
 
         # --- Save .npz outputs (one per IFF metric) ---
@@ -530,25 +571,28 @@ def run_single_touch_rf_mapping(
                     'depth_weight_alpha': float(depth_weight_alpha),
                     # Contacted vertices that reached **no estimate** and were
                     # therefore left out of the maps, summed over every touch in
-                    # the session. It sits next to ``depth_weight_alpha``
-                    # because ``zero_total_weight`` is a function of it: at
-                    # alpha = 0 every weight is exactly 1.0 and the count is
-                    # necessarily 0, and it grows as alpha concentrates credit
-                    # on the deepest contact. Counted rather than raised: a
-                    # vertex whose every contact was grazing has no penetration
-                    # evidence, so the weighted estimator is undefined there —
-                    # "no estimate" is the answer, not "stop". Never backfilled
-                    # from the unweighted mean; that would put two estimators in
-                    # one map.
+                    # the session. One cause remains: no neural value at all.
+                    # Counted rather than raised — a press with no measurement
+                    # is a fact about the recording, not a reason to stop — and
+                    # never backfilled.
                     'no_estimate_vertices': {
-                        'zero_total_weight': int(no_estimate_zero_weight),
                         'nan_neuron_value': int(no_estimate_nan_value),
-                        'total': int(
-                            no_estimate_zero_weight + no_estimate_nan_value
-                        ),
-                        'touches_with_zero_total_weight': int(
-                            touches_with_zero_weight_vertices
-                        ),
+                        'total': int(no_estimate_nan_value),
+                    },
+                    # Contacted vertices **kept** in the maps at exactly 0.0
+                    # because every frame that touched them was grazing. This sits
+                    # next to ``depth_weight_alpha`` because it is a function of
+                    # it: at alpha = 0 every weight is exactly 1.0 and the count
+                    # is necessarily 0, and it grows as alpha concentrates credit
+                    # on the deepest contact. It is a diagnostic about vertices
+                    # that are *on* the map, not an exclusion tally — the
+                    # estimator divides by the contact count, so zero total weight
+                    # yields a real 0.0 rather than 0/0. Without this number that
+                    # 0.0 reads identically to a deeply-pressed vertex whose
+                    # neuron was silent.
+                    'zero_credit_vertices': {
+                        'n_vertex_touches': int(zero_credit_vertices),
+                        'n_touches': int(touches_with_zero_credit_vertices),
                     },
                     # Which playback-cache layout the vertex identities and depths
                     # behind these maps were read through. A cache written under an

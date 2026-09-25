@@ -77,7 +77,7 @@ def compute_contact_point_heatmap(
         np.ones(len(active_verts), dtype=np.float64),
         n_verts,
     )
-    contact_count = accum.weight_sum
+    contact_count = accum.count
 
     if mode == "cumulative_iff":
         val = accum.value_sum

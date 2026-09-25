@@ -1,8 +1,8 @@
 """Accumulator sums -> the estimate, and the single definition of "no estimate".
 
-``vertex_accumulator`` produces ``value_sum`` and ``weight_sum``; this module is
-the one place that turns that pair into a firing rate, and the one place that
-decides where **no rate exists**.  It completes the trio that keeps the saved
+``vertex_accumulator`` produces ``value_sum`` and ``count``; this module is the
+one place that turns that pair into a per-vertex number, and the one place that
+decides where **no number exists**.  It completes the trio that keeps the saved
 maps and the on-screen heatmap the same numbers:
 
 * :mod:`analysis.receptive_field_mapping.data.touch_frame_weights` — one depth
@@ -20,40 +20,85 @@ drawn without complaint.  A viewer disagreeing with the file is the failure mode
 the shared-reduction work existed to prevent, so the predicate lives here and
 both callers import it.
 
+The estimator
+-------------
+::
+
+    estimate[v] = value_sum[v] / count[v]
+                = sum_{i: v_i = v} w_i * x_i  /  |{i: v_i = v}|
+
+The divisor is the **number of contact points**, not the sum of their weights.
+That choice is the whole point of the depth weighting and it is worth being
+explicit about, because the two divisors answer different questions:
+
+``/ sum(w)`` — a weighted **mean**
+    The weights cancel out of the answer.  A vertex touched only at ``w = 0.1``
+    still reports a full-size firing rate, because the small numerator is
+    divided by an equally small denominator.  Depth decides *whose sample counts
+    more*; it cannot change the level of the result.
+
+``/ count`` — an **attributed** rate, which is what this module computes
+    The weights survive into the answer.  Each contact point contributes
+    ``w_i * x_i`` but still counts as one whole sample, so a vertex that was only
+    ever brushed lightly reports a correspondingly small number.  Depth decides
+    *how much of the firing this vertex is credited with*.
+
+Worked example — three contact points on one vertex, IFF 10/20/30 Hz at weights
+1.0/0.5/0.1.  The numerator is ``10 + 10 + 3 = 23`` either way.  A weighted mean
+divides by ``1.6`` and returns ``14.375 Hz``; this estimator divides by ``3`` and
+returns ``7.667 Hz``.
+
+At ``depth_weight_alpha = 0`` every weight is exactly ``1.0``, so ``sum(w) ==
+count`` and the two forms are the *same arithmetic on the same operands*.  The
+alpha-zero parity baseline is therefore untouched by this choice, which is what
+makes the parity test still meaningful.
+
+``count`` counts contact points, not frames.  Two contact points of one frame
+landing on the same vertex are two contributions to the numerator, so they are
+two contributions to the denominator; see
+:meth:`analysis.receptive_field_mapping.data.touch_playback_data` for why such
+duplicates exist and are passed through rather than collapsed.
+
 What "no estimate" means
 ------------------------
 ``NaN`` in the returned array means **no estimate**.  It never means "zero
-response", and it must never be read as one.  Two distinct facts land on it:
-
-``weight_sum == 0``
-    Either the vertex was never contacted, or it was contacted and every frame
-    that touched it was **grazing** — it sat on or above the skin surface while
-    the press landed elsewhere.  At ``depth_weight_alpha > 0`` such a vertex
-    accumulates exactly zero total weight, so the weighted mean is ``0/0``.
-    There is **no fallback to the unweighted mean**: that would mix two
-    different estimators inside one map, and the resulting number would not be
-    comparable with its neighbours.  The vertex has zero penetration evidence,
-    so the honest output is "no estimate", not a value and not a stop.
-
-    The two sub-cases are distinguished by the *caller*, which knows the
-    contacted set: ``weight_sum == 0`` alone cannot separate "never touched"
-    from "touched, weightless".  See :func:`count_no_estimate`.
+response", and it must never be read as one.  One fact lands on it for a
+contacted vertex:
 
 ``value_sum`` is NaN
-    Every frame contributing to that vertex carried a NaN neuron value — e.g.
-    the unit was not held during the touch window.  There is a press but no
+    Every contact point contributing to that vertex carried a NaN neuron value —
+    e.g. the unit was not held during the touch window.  There is a press but no
     neural measurement.
 
-At ``depth_weight_alpha = 0`` the first case is **unreachable for a contacted
-vertex**: every weight is then exactly ``1.0`` (``0.0 ** 0.0 == 1.0``), so a
-contacted vertex always has ``weight_sum >= 1``.  Nothing in this module can
-therefore move an ``alpha = 0`` output.
+``count == 0`` also yields NaN, but for a *contacted* vertex it cannot happen:
+being contacted is precisely having at least one contact point.  It is the
+answer for the un-pressed remainder of the mesh, which callers normally exclude
+before asking.
+
+What is **no longer** a "no estimate" case
+------------------------------------------
+A vertex that was contacted but only ever **grazed** — every contact point at or
+above the skin surface, so every weight is ``0``.  Under a weighted mean its
+estimate was ``0/0``: undefined, dropped from the map, counted as an exclusion.
+Under this estimator the divisor is the contact count, which is positive, so the
+vertex lands on the map at exactly ``0.0``.
+
+That is not a degradation, it is the formula's own answer, and it is a
+*measurement*: the vertex was touched, it received zero depth credit, so zero
+firing is attributed to it.  Reporting it as missing data would now be the
+dishonest option — nothing is missing.
+
+Those vertices are still counted, by :func:`count_zero_credit`, because a ``0.0``
+that arises from zero credit is a different statement from a ``0.0`` that arises
+from a silent neuron, and a reader of the map cannot tell them apart by looking.
+The count is a diagnostic about vertices that are **on** the map, not an
+exclusion tally.
 
 Contract
 --------
-This module knows about **per-vertex sums and weights** and nothing else.  It
-must never learn about penetration depth, ``alpha``, millimetres, ``TouchEvent``,
-Qt or files.
+This module knows about **per-vertex sums, counts and weights** and nothing
+else.  It must never learn about penetration depth, ``alpha``, millimetres,
+``TouchEvent``, Qt or files.
 """
 
 from dataclasses import dataclass
@@ -62,9 +107,10 @@ import numpy as np
 
 __all__ = [
     "NoEstimateCounts",
-    "weighted_mean_or_nan",
+    "attributed_mean_or_nan",
     "has_estimate",
     "count_no_estimate",
+    "count_zero_credit",
 ]
 
 
@@ -72,92 +118,139 @@ __all__ = [
 class NoEstimateCounts:
     """How many entries have no estimate, split by cause.
 
-    The two causes are kept apart because they are different statements about
-    the data: ``zero_weight`` says the press never pressed in at that vertex,
-    ``nan_value`` says there was no neural measurement while it did.  Both are
-    excluded from the emitted map; collapsing them into one number would make
-    "the electrode dropped out" indistinguishable from "the finger only grazed".
+    ``nan_value`` says there was no neural measurement while the vertex was
+    pressed.  ``no_contact`` says there were no contact points at all, which is
+    zero for any caller that has already restricted to the contacted set — it is
+    kept separate rather than merged so that a caller passing an unrestricted
+    array sees the two apart instead of reading the whole un-pressed mesh as
+    missing data.
+
+    Note what is *not* here: a grazing-only vertex.  It is no longer an
+    exclusion — it has an estimate of ``0.0`` — and is counted by
+    :func:`count_zero_credit` instead.
     """
 
-    zero_weight: int
     nan_value: int
+    no_contact: int
 
     @property
     def total(self) -> int:
         """Entries excluded from the map for either reason."""
-        return self.zero_weight + self.nan_value
+        return self.nan_value + self.no_contact
 
 
-def _as_pair(value_sum, weight_sum):
+def _as_pair(value_sum, count):
     """Validate and return the two 1-D float arrays this module operates on."""
     values = np.asarray(value_sum, dtype=np.float64)
-    weights = np.asarray(weight_sum, dtype=np.float64)
-    if values.ndim != 1 or weights.ndim != 1:
+    counts = np.asarray(count, dtype=np.float64)
+    if values.ndim != 1 or counts.ndim != 1:
         raise ValueError(
-            f"vertex_estimate: value_sum and weight_sum must be 1-D, one entry "
-            f"per vertex; got shapes {values.shape} and {weights.shape}."
+            f"vertex_estimate: value_sum and count must be 1-D, one entry "
+            f"per vertex; got shapes {values.shape} and {counts.shape}."
         )
-    if values.shape != weights.shape:
+    if values.shape != counts.shape:
         raise ValueError(
-            f"vertex_estimate: value_sum and weight_sum must cover the same "
+            f"vertex_estimate: value_sum and count must cover the same "
             f"vertices in the same order; got {values.shape} and "
-            f"{weights.shape}. A mismatch means the numerator and the "
+            f"{counts.shape}. A mismatch means the numerator and the "
             f"denominator have been sliced differently, which would divide one "
-            f"vertex's total by another vertex's weight."
+            f"vertex's total by another vertex's contact count."
         )
-    return values, weights
+    if np.any(counts < 0.0):
+        bad = np.flatnonzero(counts < 0.0)
+        raise ValueError(
+            f"vertex_estimate: count holds negative value(s) at index/indices "
+            f"{bad.tolist()[:10]} (values {counts[bad].tolist()[:10]}). A contact "
+            f"count is a tally of contact points and cannot be negative; a "
+            f"negative one means a weight array has been passed where the "
+            f"accumulator's ``count`` was expected."
+        )
+    return values, counts
 
 
-def weighted_mean_or_nan(value_sum, weight_sum) -> np.ndarray:
-    """Return ``value_sum / weight_sum``, or ``NaN`` where there is no estimate.
+def attributed_mean_or_nan(value_sum, count) -> np.ndarray:
+    """Return ``value_sum / count``, or ``NaN`` where there is no estimate.
 
-    The divisor is the **weight sum**, never a frame or contact count: dividing
-    by the count would leave the weight in the answer as a scale factor and the
-    number would stop being a firing rate.
+    The divisor is the **contact count**, never the weight sum: dividing by the
+    weight sum would cancel the depth weighting back out of the answer and turn
+    the result into a plain weighted mean, in which a barely-grazed vertex is
+    indistinguishable from a fully-pressed one.  See the module docstring for the
+    worked example.
 
     ``NaN`` in the result means *no estimate* — see the module docstring.  It is
-    never a measured zero.
+    never a measured zero.  A grazing-only vertex is a measured zero and comes
+    back as ``0.0``.
 
     Notes
     -----
-    Where ``weight_sum > 0`` the returned value is exactly
-    ``value_sum / weight_sum`` — the same IEEE division, on the same operands,
-    that a bare ``value_sum / weight_sum`` would produce.  The guard only
-    substitutes the divisor where the quotient would be ``0/0``, so it cannot
-    perturb any vertex that has an estimate.
+    Where ``count > 0`` the returned value is exactly ``value_sum / count`` — the
+    same IEEE division, on the same operands, that a bare ``value_sum / count``
+    would produce.  The guard only substitutes the divisor where the quotient
+    would be ``0/0``, so it cannot perturb any vertex that has an estimate.
     """
-    values, weights = _as_pair(value_sum, weight_sum)
-    has_weight = weights > 0.0
-    return np.where(has_weight, values / np.where(has_weight, weights, 1.0), np.nan)
+    values, counts = _as_pair(value_sum, count)
+    contacted = counts > 0.0
+    return np.where(
+        contacted, values / np.where(contacted, counts, 1.0), np.nan
+    )
 
 
-def has_estimate(value_sum, weight_sum) -> np.ndarray:
-    """Boolean mask: ``True`` where a weighted mean exists for that entry.
+def has_estimate(value_sum, count) -> np.ndarray:
+    """Boolean mask: ``True`` where an estimate exists for that entry.
 
     This is *the* predicate.  The pipeline uses it to decide which vertices
     reach the saved ``.npz``; the playback viewer's ``NaN`` mask is its
     complement, so the vertices painted grey on screen and the vertices absent
     from the file are the same set by construction rather than by agreement.
     """
-    return ~np.isnan(weighted_mean_or_nan(value_sum, weight_sum))
+    return ~np.isnan(attributed_mean_or_nan(value_sum, count))
 
 
-def count_no_estimate(value_sum, weight_sum) -> NoEstimateCounts:
+def count_no_estimate(value_sum, count) -> NoEstimateCounts:
     """Count entries with no estimate, split by cause.
 
     Parameters
     ----------
-    value_sum, weight_sum:
+    value_sum, count:
         The accumulator totals **already restricted to the contacted entries**.
         Restriction is the caller's job because only the caller holds the
-        contacted set: an untouched vertex and an all-grazing vertex both leave
-        ``weight_sum == 0``, and counting the first as an exclusion would report
-        the whole un-pressed mesh as missing data.
+        contacted set; passing the whole mesh would report every un-pressed
+        vertex as missing data.
     """
-    values, weights = _as_pair(value_sum, weight_sum)
-    zero_weight = weights <= 0.0
-    no_estimate = np.isnan(weighted_mean_or_nan(values, weights))
+    values, counts = _as_pair(value_sum, count)
+    no_contact = counts <= 0.0
+    no_estimate = np.isnan(attributed_mean_or_nan(values, counts))
     return NoEstimateCounts(
-        zero_weight=int(np.count_nonzero(zero_weight)),
-        nan_value=int(np.count_nonzero(no_estimate & ~zero_weight)),
+        nan_value=int(np.count_nonzero(no_estimate & ~no_contact)),
+        no_contact=int(np.count_nonzero(no_contact)),
     )
+
+
+def count_zero_credit(count, weight_sum) -> int:
+    """Count contacted entries whose total weight is ``0``.
+
+    These vertices **are** on the map, at exactly ``0.0``: they were pressed, and
+    every press that touched them was grazing, so the attributed rate is zero.
+    The number exists because that ``0.0`` is indistinguishable, on screen and in
+    the ``.npz``, from the ``0.0`` of a vertex that was pressed deeply while the
+    neuron stayed silent — and the two are entirely different observations.
+
+    Zero at ``depth_weight_alpha = 0``, where every weight is exactly ``1.0``.
+
+    Parameters
+    ----------
+    count, weight_sum:
+        Accumulator totals restricted to the contacted entries, as for
+        :func:`count_no_estimate`.  ``count`` is required rather than inferred so
+        that an un-pressed vertex (``count == 0``, ``weight_sum == 0``) is not
+        counted as a grazing one.
+    """
+    counts = np.asarray(count, dtype=np.float64)
+    weights = np.asarray(weight_sum, dtype=np.float64)
+    if counts.shape != weights.shape:
+        raise ValueError(
+            f"count_zero_credit: count and weight_sum must cover the same "
+            f"vertices in the same order; got {counts.shape} and "
+            f"{weights.shape}."
+        )
+    return int(np.count_nonzero((counts > 0.0) & (weights <= 0.0)))

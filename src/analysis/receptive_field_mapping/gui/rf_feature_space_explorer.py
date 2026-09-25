@@ -64,7 +64,7 @@ def vertex_value_mean(
         np.ones(len(vertex_idx), dtype=np.float64),
         n_verts,
     )
-    n_contacts = accum.weight_sum
+    n_contacts = accum.count.astype(np.float64)
     mean = np.divide(
         accum.value_sum, n_contacts,
         out=np.zeros(n_verts), where=n_contacts > 0,

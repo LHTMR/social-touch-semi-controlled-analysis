@@ -24,12 +24,20 @@ weight ``w_i``::
     value_max[v]     = max_{i: v_i = v} x_i        # UNWEIGHTED, see below
     weight_sum[v]    = sum_{i: v_i = v} w_i
     weight_sq_sum[v] = sum_{i: v_i = v} w_i**2
+    count[v]         = |{i: v_i = v}|              # contact points, not frames
 
 ``value_max`` is deliberately **unweighted**.  A weighted maximum has no
 meaning: scaling a sample by ``w`` does not make it "less of a maximum", it
 makes it a different number in different units.  The max map answers "what is
 the strongest response ever seen at this vertex", which is a statement about
 the observed values themselves, so weights play no part in it.
+
+``count`` is the plain number of contact points that landed on the vertex — the
+``N`` the estimator divides by.  It counts *contact points*, not frames: two
+contact points of the same frame landing on one vertex are two contributions,
+which is exactly how they enter ``value_sum``.  It is not derivable from
+``weight_sum`` (that is the sum of the weights, which only equals the count when
+every weight is ``1``), so it is accumulated here rather than reconstructed.
 
 ``weight_sq_sum`` is accumulated even though nothing reads it yet.  It is the
 denominator of the Kish effective sample size ``n_eff = (sum w)^2 / sum(w^2)``
@@ -69,6 +77,7 @@ class AccumResult:
     value_max: np.ndarray
     weight_sum: np.ndarray
     weight_sq_sum: np.ndarray
+    count: np.ndarray
 
 
 def empty_accumulator(n_vertices: int) -> AccumResult:
@@ -76,7 +85,7 @@ def empty_accumulator(n_vertices: int) -> AccumResult:
 
     ``value_max`` starts at ``-inf`` so that the first observed value at a
     vertex wins; untouched vertices stay at ``-inf`` and are identified by
-    ``weight_sum == 0``, never by inspecting ``value_max``.
+    ``count == 0``, never by inspecting ``value_max``.
     """
     if not isinstance(n_vertices, (int, np.integer)) or isinstance(n_vertices, bool):
         raise TypeError(
@@ -94,6 +103,7 @@ def empty_accumulator(n_vertices: int) -> AccumResult:
         value_max=np.full(n, -np.inf, dtype=np.float64),
         weight_sum=np.zeros(n, dtype=np.float64),
         weight_sq_sum=np.zeros(n, dtype=np.float64),
+        count=np.zeros(n, dtype=np.int64),
     )
 
 
@@ -183,6 +193,7 @@ def accumulate_vertex_values_into(
     np.maximum.at(result.value_max, idx, val)
     np.add.at(result.weight_sum, idx, wgt)
     np.add.at(result.weight_sq_sum, idx, wgt * wgt)
+    np.add.at(result.count, idx, 1)
 
 
 def accumulate_vertex_values(

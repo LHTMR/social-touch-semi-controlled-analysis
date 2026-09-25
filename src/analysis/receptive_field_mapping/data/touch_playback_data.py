@@ -217,24 +217,22 @@ class _BlockVertexSource:
         the same vertex where the mesh is coarser than epsilon. Both rows are returned
         and the accumulator's ``np.add.at`` sums them::
 
-            numerator   += IFF_f * w1 + IFF_f * w2  ==  IFF_f * (w1 + w2)
-            denominator += w1 + w2
+            numerator += IFF_f * w1 + IFF_f * w2  ==  IFF_f * (w1 + w2)
+            count     += 2
 
-        A frame's IFF is one **scalar**, shared by every contact point of that frame,
-        so it factors out for *any* weights: the vertex is credited with ``IFF_f`` at
-        weight ``w1 + w2``, and its weighted mean is exactly what a single row of
-        weight ``w1 + w2`` would have produced. An earlier version of this loader
-        raised here, on the stated premise that the cancellation held "only while
-        every depth weight is 1"; that premise was false — the algebra above never
-        depended on the weights — and the check was removed rather than softened.
+        so the vertex's attributed rate takes the **mean of the two weights** for
+        that frame, ``IFF_f * (w1 + w2) / 2``, exactly as it would for two contact
+        points in two different frames. Two contact points are two samples, and the
+        estimator counts them as two.
 
-        The consequence, which is intended: such a vertex carries **more than unit
-        weight** for that frame. The weighting deliberately does not normalise per
-        frame, so a frame's total weight already scales with how much of the patch it
-        covers, and a vertex that caught two contact points genuinely had more finger
-        on it. Note this is a statement about the *mean* only — the Kish ``n_eff``
-        computed downstream does distinguish the two forms, because two rows are two
-        contributions.
+        This is a place where the divisor choice is visible. Under a weighted mean —
+        ``sum(w * x) / sum(w)`` — the frame's scalar IFF factored out of numerator and
+        denominator alike, so a duplicate row could not move the answer at all and
+        merging the two rows into one of weight ``w1 + w2`` was exactly equivalent.
+        Dividing by the contact count instead, that equivalence is gone: merging would
+        credit one sample where two landed, and the vertex would report ``IFF_f *
+        (w1 + w2)`` rather than half of it. So the rows must stay separate, which is
+        what this loader does — and it must not be "optimised" back into a merge.
 
         Nothing is deduplicated, averaged, or collapsed deepest-wins here: each
         sidecar row is one contact point that landed on that vertex, and picking a
@@ -289,10 +287,9 @@ class _BlockVertexSource:
 
         # Returned in file order, one element per contact point, duplicates included.
         # A ``vertex_id`` appearing twice here means two contact points of this frame
-        # landed on the same vertex; downstream that vertex is credited with this
-        # frame's IFF at the *summed* weight ``w1 + w2`` (which may exceed 1), because
-        # the frame's IFF is a scalar and factors out of both numerator and
-        # denominator. See this method's docstring: transport, never reduction.
+        # landed on the same vertex; downstream that is two samples — numerator
+        # ``IFF_f * (w1 + w2)``, count ``2`` — not one sample of weight ``w1 + w2``.
+        # See this method's docstring: transport, never reduction.
         return _FrameRows(vertex_ids=vertex_ids, signed_depth_mm=depths)
 
 
